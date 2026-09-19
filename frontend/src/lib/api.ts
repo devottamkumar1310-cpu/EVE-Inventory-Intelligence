@@ -17,21 +17,22 @@ function sanitizeApiUrl(raw: string | undefined): string {
 function resolveApiBaseUrl(): string {
   const envUrl = sanitizeApiUrl(process.env.NEXT_PUBLIC_API_URL);
 
-  // Must start with http:// or https:// to be a valid absolute API base URL
+  // Hard-reject the old suspended Cloud Run URL if it's injected by Vercel
+  if (envUrl && envUrl.includes("eve-backend-68416570138.us-central1.run.app")) {
+    return "https://eve-backend-264f.onrender.com";
+  }
+
+  // Allow valid overrides (e.g. localhost, local network testing)
   if (envUrl && (envUrl.startsWith("http://") || envUrl.startsWith("https://"))) {
     return envUrl;
   }
 
+  // Default fallbacks
   if (typeof window !== "undefined") {
     if (window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
       return "https://eve-backend-264f.onrender.com";
     }
     return "http://127.0.0.1:8000";
-  }
-
-  // Server-side environment (Next.js Server Routes / SSR)
-  if (process.env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production") {
-    return "https://eve-backend-264f.onrender.com";
   }
 
   return "https://eve-backend-264f.onrender.com";

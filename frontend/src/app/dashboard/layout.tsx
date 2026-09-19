@@ -679,6 +679,19 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   }
 
   if (initError) {
+    let title = "Connection Failed";
+    let message = initError;
+
+    if (initError.includes("Session expired") || initError.includes("Authentication error")) {
+      title = "Authentication Required";
+    } else if (initError.includes("API Error") || initError.includes("500")) {
+      title = "Server Error";
+    } else if (initError.includes("timed out")) {
+      title = "Request Timeout";
+    } else if (initError.includes("SERVER_INITIALIZING")) {
+      title = "Starting Up";
+    }
+
     return (
       <div className="min-h-screen bg-background flex flex-col items-center justify-center p-6 text-foreground font-sans">
         <div className="w-full max-w-sm bg-card backdrop-blur-md rounded-2xl border border-red-900/40 p-8 shadow-2xl space-y-6 animate-fade-in">
@@ -688,8 +701,8 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
             </div>
           </div>
           <div className="text-center space-y-2">
-            <h3 className="text-lg font-bold tracking-tight text-red-400">Connection Failed</h3>
-            <p className="text-xs text-muted-foreground leading-relaxed">{initError}</p>
+            <h3 className="text-lg font-bold tracking-tight text-red-400">{title}</h3>
+            <p className="text-xs text-muted-foreground leading-relaxed">{message}</p>
           </div>
           <div className="space-y-3 pt-2">
             <button
