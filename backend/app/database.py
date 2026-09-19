@@ -40,30 +40,31 @@ else:
     # Prevents request pile-up during overload instead of hanging forever.
     engine_args["pool_timeout"] = 30
 
-# Attempt connection to Postgres. If it fails, fallback to SQLite for local development.
+# Create engine lazily: create_engine() is non-blocking (no network call).
+# The first actual connection is deferred until init_db() runs in the background
+# task, so Uvicorn binds to $PORT immediately without any WAN round-trip.
 Base = declarative_base()
 engine = None
 SessionLocal = None
 
 try:
     from sqlalchemy.engine.url import make_url
-    
+
     # 1. Log environment loading status by checking if it matches the default fallback
     is_default = (database_url == "postgresql://postgres:postgres@localhost:5432/eve")
     logger.info(f"[DB CONFIG] .env loaded custom DATABASE_URL: {not is_default}")
-    
-    # 2. Parse and log host and username safely
+
+    # 2. Parse and log host and username safely (no connection made here)
     parsed_url = make_url(database_url)
     host_info = parsed_url.host if parsed_url.host else "Unix Socket/Local"
     logger.info(f"[DB CONFIG] Parsed Host: {host_info}")
     logger.info(f"[DB CONFIG] Parsed Username: {parsed_url.username}")
-    
+
+    # create_engine() is lazy — no socket opened, no WAN round-trip.
     engine = create_engine(database_url, **engine_args)
-    # Test connection
-    with engine.connect() as conn:
-        logger.info("Database connection established successfully.")
+    logger.info("[DB CONFIG] SQLAlchemy engine created (connection deferred until first use).")
 except Exception as e:
-    logger.error(f"Failed to connect to primary database: {e}")
+    logger.error(f"Failed to configure primary database engine: {e}")
     logger.warning("Falling back to local SQLite database 'eve_mvp.db'.")
     fallback_url = "sqlite:///eve_mvp.db"
     engine = create_engine(fallback_url, connect_args={"check_same_thread": False})

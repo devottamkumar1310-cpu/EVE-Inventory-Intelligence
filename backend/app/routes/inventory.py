@@ -12,7 +12,8 @@
 import io
 import datetime
 import logging
-import pandas as pd
+# NOTE: pandas is imported lazily inside the upload handlers (not at module level)
+# to avoid adding ~770ms to cold start time.
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -23,7 +24,29 @@ from app.database import get_db
 from app.models.product import Product
 from app.models.inventory import InventoryItem, SalesRecord
 from app.core.security import get_current_user_and_tenant, require_workspace_role
-from app.services.importer_service import ImporterService
+# Both pandas and ImporterService are imported lazily (on first CSV upload request)
+# because importer_service.py eagerly imports pandas, which adds ~770ms to cold start time.
+_importer_service_module = None
+_pandas_module = None
+
+
+def _get_importer():
+    global _importer_service_module
+    if _importer_service_module is None:
+        from app.services.importer_service import ImporterService as _IS
+        _importer_service_module = _IS
+    return _importer_service_module
+
+
+def _pd():
+    """Lazy pandas accessor — import deferred to first CSV upload request."""
+    global _pandas_module
+    if _pandas_module is None:
+        import pandas as _pandas
+        _pandas_module = _pandas
+    return _pandas_module
+
+
 from app.core.rate_limiter import rate_limit
 from app.fashion.gmroi import calculate_gmroi
 from app.fashion.sell_through import calculate_sell_through_rate
@@ -66,14 +89,14 @@ def upload_inventory_csv(
             )
         
         try:
-            df = pd.read_csv(io.BytesIO(contents))
-        except (pd.errors.EmptyDataError, pd.errors.ParserError) as pe:
+            df = _pd().read_csv(io.BytesIO(contents))
+        except (_pd().errors.EmptyDataError, _pd().errors.ParserError) as pe:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"status": "error", "message": f"Failed to parse CSV file: {str(pe)}"}
             )
 
-        report = ImporterService.import_inventory(db, org_id, df)
+        report = _get_importer().import_inventory(db, org_id, df)
         if report["status"] == "error":
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=report)
         if background_tasks:
@@ -116,14 +139,14 @@ def upload_sales_csv(
             )
 
         try:
-            df = pd.read_csv(io.BytesIO(contents))
-        except (pd.errors.EmptyDataError, pd.errors.ParserError) as pe:
+            df = _pd().read_csv(io.BytesIO(contents))
+        except (_pd().errors.EmptyDataError, _pd().errors.ParserError) as pe:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"status": "error", "message": f"Failed to parse CSV file: {str(pe)}"}
             )
 
-        report = ImporterService.import_sales(db, org_id, df)
+        report = _get_importer().import_sales(db, org_id, df)
         if report["status"] == "error":
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=report)
         if background_tasks:
@@ -166,14 +189,14 @@ def upload_product_costs_csv(
             )
 
         try:
-            df = pd.read_csv(io.BytesIO(contents))
-        except (pd.errors.EmptyDataError, pd.errors.ParserError) as pe:
+            df = _pd().read_csv(io.BytesIO(contents))
+        except (_pd().errors.EmptyDataError, _pd().errors.ParserError) as pe:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"status": "error", "message": f"Failed to parse CSV file: {str(pe)}"}
             )
 
-        report = ImporterService.import_costs(db, org_id, df)
+        report = _get_importer().import_costs(db, org_id, df)
         if report["status"] == "error":
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=report)
         if background_tasks:
@@ -232,8 +255,8 @@ def upload_master_csv(
             )
 
         try:
-            df = pd.read_csv(io.BytesIO(contents))
-        except (pd.errors.EmptyDataError, pd.errors.ParserError) as pe:
+            df = _pd().read_csv(io.BytesIO(contents))
+        except (_pd().errors.EmptyDataError, _pd().errors.ParserError) as pe:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"status": "error", "message": f"Failed to parse CSV file: {str(pe)}"}
@@ -262,8 +285,8 @@ def upload_master_csv(
             # Validate BEFORE deleting anything. A malformed CSV must never be
             # able to empty a workspace — the merchant would lose the demo they
             # were still evaluating and get nothing in return.
-            precheck = ImporterService.normalize_shopify_export(df.copy())
-            is_valid, missing = ImporterService.validate_schema(precheck, ["sku"])
+            precheck = _get_importer().normalize_shopify_export(df.copy())
+            is_valid, missing = _get_importer().validate_schema(precheck, ["sku"])
             if not is_valid:
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -289,7 +312,7 @@ def upload_master_csv(
             db.commit()
             logger.info(f"Master Upload: replaced demo data for Org {org_id}; workspace is now merchant-owned")
 
-        report = ImporterService.import_master(db, org_id, df)
+        report = _get_importer().import_master(db, org_id, df)
         if report["status"] == "error":
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content=report)
         if background_tasks:
@@ -325,7 +348,7 @@ def preview_upload_csv(
         if not contents or len(contents) == 0:
             return JSONResponse(status_code=400, content={"status": "error", "message": "File is empty."})
         
-        df = pd.read_csv(io.BytesIO(contents))
+        df = _pd().read_csv(io.BytesIO(contents))
         df.columns = [c.strip().lower() for c in df.columns]
         
         if "sku" not in df.columns or "name" not in df.columns:
@@ -702,4 +725,6 @@ def get_inventory_alerts(
         "total_capital_locked": total_capital_locked,
         "total_recommended_order_units": total_recommended_order_units,
     }
+
+
 

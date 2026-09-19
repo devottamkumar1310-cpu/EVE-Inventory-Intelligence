@@ -42,6 +42,8 @@ export const API_BASE_URL = resolveApiBaseUrl();
 if (typeof window !== "undefined") {
   devLog(`[EVE Config] API Base URL resolved to: ${API_BASE_URL}`);
 }
+import { toast } from "sonner";
+
 /**
  * Centralized fetch wrapper for authenticated API calls.
  *
@@ -50,29 +52,95 @@ if (typeof window !== "undefined") {
  * - Redirects to /login with a human-readable "session expired" message.
  * - Throws immediately so the calling service never receives a partial response.
  *
- * All other responses are passed through unchanged — error handling
- * (404, 422, 500, etc.) remains the responsibility of the individual service.
+ * Also intercepts 503 SERVER_INITIALIZING responses:
+ * - Retries automatically with bounded exponential backoff for up to 60s.
+ * - Respects the Retry-After header if present.
+ * - Shows a "EVE is starting up. Please wait..." toast while waiting.
  *
- * Usage: replace `fetch(url, options)` with `apiFetch(url, options)` in any
- * authenticated service. Do NOT use this for unauthenticated calls (e.g. /login).
+ * All other responses are passed through unchanged.
  */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const res = await fetch(url, options);
-  if (res.status === 401) {
-    logger.warn("[EVE] 401 Unauthorized — session expired. Signing out.");
-    try {
-      // Dynamically import to avoid circular dependency with supabase client.
-      const { createClient } = await import("@/lib/supabase/client");
-      await createClient().auth.signOut();
-    } catch (e) {
-      logger.error("[EVE] signOut failed during 401 redirect:", e);
+  const MAX_RETRY_TIME_MS = 60000;
+  const startTime = Date.now();
+  let attempt = 0;
+  let initToastId: string | number | null = null;
+
+  while (true) {
+    attempt++;
+    const res = await fetch(url, options);
+
+    // 1. Handle 503 SERVER_INITIALIZING
+    if (res.status === 503) {
+      let isInitializing = false;
+      try {
+        const clone = res.clone();
+        const data = await clone.json();
+        if (data && data.code === "SERVER_INITIALIZING") {
+          isInitializing = true;
+        }
+      } catch (e) {
+        // Not JSON or unable to parse, ignore
+      }
+
+      if (isInitializing) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed < MAX_RETRY_TIME_MS) {
+          // Show toast on first retry
+          if (!initToastId && typeof window !== "undefined") {
+            initToastId = toast.loading("EVE is starting up. Please wait...", {
+              duration: MAX_RETRY_TIME_MS,
+            });
+          }
+
+          // Default bounded exponential backoff (max 10s)
+          let waitMs = Math.min(1000 * Math.pow(1.5, attempt - 1), 10000);
+          
+          // Respect Retry-After if present
+          const retryAfterHeader = res.headers.get("Retry-After");
+          if (retryAfterHeader) {
+            const parsed = parseInt(retryAfterHeader, 10);
+            if (!isNaN(parsed) && parsed > 0) {
+              waitMs = parsed * 1000;
+            }
+          }
+
+          await sleep(waitMs);
+          continue; // Retry the request
+        } else {
+          // Exhausted the 60s window, clear toast and let caller handle the 503
+          if (initToastId && typeof window !== "undefined") {
+            toast.dismiss(initToastId);
+          }
+          return res;
+        }
+      }
     }
-    // Redirect to login. Using window.location.href to guarantee a full page
-    // reload which clears all in-memory React state.
-    if (typeof window !== "undefined") {
-      window.location.href = "/login?message=Session+expired.+Please+sign+in+again.";
+
+    // Dismiss toast if we got a successful/non-503 response after retrying
+    if (initToastId && typeof window !== "undefined") {
+      toast.dismiss(initToastId);
     }
-    throw new Error("Session expired. Please sign in again.");
+
+    // 2. Handle 401 Unauthorized
+    if (res.status === 401) {
+      logger.warn("[EVE] 401 Unauthorized — session expired. Signing out.");
+      try {
+        // Dynamically import to avoid circular dependency with supabase client.
+        const { createClient } = await import("@/lib/supabase/client");
+        await createClient().auth.signOut();
+      } catch (e) {
+        logger.error("[EVE] signOut failed during 401 redirect:", e);
+      }
+      // Redirect to login. Using window.location.href to guarantee a full page
+      // reload which clears all in-memory React state.
+      if (typeof window !== "undefined") {
+        window.location.href = "/login?message=Session+expired.+Please+sign+in+again.";
+      }
+      throw new Error("Session expired. Please sign in again.");
+    }
+    
+    return res;
   }
-  return res;
 }

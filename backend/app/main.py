@@ -3,9 +3,13 @@
 # DATA FLOW: Initializes database -> sets up routes -> configures CORS -> runs Web server.
 # EXTENSION POINTS: Add global exception handlers, rate limiters, or mount websocket gateways.
 # ARCHITECTURAL DECISION:
-# - Connects the database and configures CORS at startup to ensure immediate readiness.
+# - Uvicorn binds to $PORT immediately; heavy DB init runs in a background asyncio task.
+# - A readiness guard returns 503 SERVER_INITIALIZING on /api/* until the background
+#   task completes, so the app is reachable within 1-2 seconds on every cold start.
 # ==============================================================================
 
+import asyncio
+import enum
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Request
@@ -19,21 +23,14 @@ from app.core.logging import setup_logging
 from app.routes import inventory
 from app.routes import chat
 from app.routes import dashboard
-# Import all self-registering services, memory layers, and managers
-import app.models
-import app.services.gemini_service
-import app.services.analytics_service
-import app.services.competitor_service
-import app.services.report_service
-import app.services.supplier_service
-import app.memory.embeddings
-import app.memory.retrieval
-import app.memory.short_term
-import app.memory.long_term
-import app.memory.memory_manager
-import app.knowledge.knowledge_manager
-# pyrefly: ignore [missing-import]
-import app.artifacts.artifact_manager
+# Import model registrations so Base.metadata is fully populated before init_db().
+# These are lightweight: no pandas, no google.genai, no openpyxl.
+import app.models  # noqa: F401
+# NOTE: Heavy service modules (gemini_service, report_service, embeddings, analytics_service,
+# competitor_service, supplier_service, memory layers, knowledge_manager, artifact_manager)
+# are intentionally NOT imported at module level. They are imported lazily inside the
+# background init task or inside the individual route handlers that use them, so they
+# do not block Uvicorn port binding during cold start.
 
 logger = logging.getLogger("eve.main")
 
@@ -58,36 +55,86 @@ if settings.FRONTEND_URL:
 logger.info(f"[CORS] Allowed origins at module load: {allowed_origins}")
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# APP READINESS STATE
+# Tracks whether the background database initialisation has completed.
+# All /api/* endpoints check this before processing a request.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _ReadinessState(enum.Enum):
+    INITIALIZING = "initializing"
+    READY        = "ready"
+    FAILED       = "failed"
+
+_app_state = _ReadinessState.INITIALIZING
+_init_failure_detail: str = ""
+
+
+def _mark_ready() -> None:
+    global _app_state
+    _app_state = _ReadinessState.READY
+
+
+def _mark_failed(detail: str) -> None:
+    global _app_state, _init_failure_detail
+    _app_state = _ReadinessState.FAILED
+    _init_failure_detail = detail
+
+
+def is_ready() -> bool:
+    return _app_state == _ReadinessState.READY
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BACKGROUND INITIALISATION TASK
+# Runs init_db() and validate_schema() asynchronously after Uvicorn has bound.
+# Uses run_in_executor so blocking SQLAlchemy calls don't stall the event loop.
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _background_init() -> None:
+    """
+    Run database initialisation and schema validation in a thread pool so the
+    event loop (and therefore Uvicorn's port binding) is never blocked.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        logger.info("[STARTUP] Background init started: running init_db() ...")
+        await loop.run_in_executor(None, init_db)
+        logger.info("[STARTUP] init_db() completed. Running validate_schema() ...")
+        await loop.run_in_executor(None, validate_schema)
+        logger.info("[STARTUP] validate_schema() completed. App is READY.")
+        _mark_ready()
+    except SchemaValidationError as exc:
+        detail = f"Schema mismatch: {exc}"
+        logger.critical(f"[STARTUP] {detail}")
+        _mark_failed(detail)
+    except Exception as exc:
+        detail = f"Database initialisation failed: {exc}"
+        logger.critical(f"[STARTUP] {detail}", exc_info=exc)
+        _mark_failed(detail)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Handles application startup and shutdown lifecycle events.
+
+    Uvicorn binds to 0.0.0.0:$PORT as soon as this yields — within 1-2 seconds.
+    The expensive init_db() / validate_schema() work runs in the background so
+    cold starts no longer trigger Render's port-binding timeout.
     """
     # 1. Setup structured logging
     setup_logging(level="INFO")
-    logger.info("Initializing EVE Platform services...")
+    logger.info("EVE Platform starting — launching background DB initialisation ...")
     logger.info(f"[CORS] Allowed origins active: {allowed_origins}")
 
-    # 2. Setup database schema structures
-    try:
-        init_db()
-        logger.info("EVE Platform database initialized successfully.")
-    except Exception as e:
-        logger.critical(f"Failed to bootstrap database schemas: {e}", exc_info=e)
-        raise
+    # 2. Fire off background initialisation (non-blocking).
+    asyncio.create_task(_background_init())
 
-    # 3. Validate live database schema matches SQLAlchemy models.
-    try:
-        validate_schema()
-    except SchemaValidationError:
-        logger.critical(
-            "Startup aborted: database schema mismatch detected. "
-            "Run 'alembic upgrade head' against production before deploying."
-        )
-        raise
-
+    # 3. Yield immediately so Uvicorn binds to $PORT.
     yield
-    logger.info("Shutting down EVE Platform services...")
+
+    logger.info("Shutting down EVE Platform services ...")
 
 
 # Initialize FastAPI app instance
@@ -99,15 +146,96 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
+# READINESS GUARD MIDDLEWARE
+# Gates all /api/* requests until the background DB init completes.
+# Passes OPTIONS (CORS preflights) through unconditionally so browsers always
+# receive their CORS headers regardless of app readiness state.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ReadinessGuardMiddleware:
+    """
+    Returns 503 SERVER_INITIALIZING for any /api/* request while the background
+    database initialisation is still running. This prevents requests from
+    hitting uninitialised database state.
+
+    Exempt paths (always pass through):
+      - OPTIONS requests (CORS preflights must always get a CORS response)
+      - / and /healthz (liveness probes must not be blocked)
+      - /docs, /redoc, /openapi.json (Swagger UI)
+
+    Note: Starlette adds CORS headers to responses from this middleware because
+    CORSMiddleware is registered AFTER this one and therefore runs FIRST in
+    Starlette's LIFO execution order.
+    """
+
+    # Paths that must always be served regardless of readiness state.
+    _EXEMPT_PREFIXES = ("/docs", "/redoc", "/openapi.json")
+    _EXEMPT_EXACT    = {"/", "/healthz"}
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        import json
+        from fastapi.responses import JSONResponse
+
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        method = scope.get("method", "")
+        path   = scope.get("path", "")
+
+        # Always pass through OPTIONS (CORS preflights) and exempt paths.
+        if (
+            method == "OPTIONS"
+            or path in self._EXEMPT_EXACT
+            or any(path.startswith(p) for p in self._EXEMPT_PREFIXES)
+        ):
+            return await self.app(scope, receive, send)
+
+        # For all /api/* routes, enforce readiness.
+        if path.startswith("/api/"):
+            if _app_state == _ReadinessState.INITIALIZING:
+                response = JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "error",
+                        "code": "SERVER_INITIALIZING",
+                        "message": "Server is initializing. Please retry in a few seconds.",
+                    },
+                    headers={"Retry-After": "5"},
+                )
+                await response(scope, receive, send)
+                return
+            if _app_state == _ReadinessState.FAILED:
+                response = JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "error",
+                        "code": "SERVER_INIT_FAILED",
+                        "message": "Server failed to initialize. Check deployment logs.",
+                        "detail": _init_failure_detail,
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
+        return await self.app(scope, receive, send)
+
+# ──────────────────────────────────────────────────────────────────────────────
 # MIDDLEWARE REGISTRATION ORDER NOTE
 # Starlette processes middleware in REVERSE registration order.
 # The LAST middleware added runs FIRST on incoming requests.
 #
 # Desired execution order (request in → response out):
-#   SecurityHeadersMiddleware  →  CORSMiddleware  →  Router
+#   CORSMiddleware → ReadinessGuardMiddleware → SecurityHeadersMiddleware → Router
 #
-# To achieve this, CORSMiddleware must be added LAST (it runs first).
-# SecurityHeadersMiddleware must be added FIRST (it runs last, on the way out).
+# To achieve this:
+#   - CORSMiddleware is added LAST (executes FIRST — intercepts OPTIONS preflights
+#     before ReadinessGuard can block them, so CORS headers always flow back).
+#   - ReadinessGuardMiddleware is added second-to-last (blocks /api/* while INITIALIZING;
+#     OPTIONS are passed through unconditionally inside the middleware itself as a backup).
+#   - SecurityHeadersMiddleware is added FIRST (executes LAST — on response out).
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 1. Add SecurityHeadersMiddleware FIRST (executes LAST — on response out).
@@ -143,8 +271,12 @@ from app.core.internal_analytics_middleware import InternalTelemetryMiddleware
 app.add_middleware(InternalTelemetryMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 
-# 2. Add CORSMiddleware LAST (executes FIRST — intercepts OPTIONS preflights
-#    before any other middleware or router sees them).
+# 2. Add ReadinessGuardMiddleware second-to-last (executes second — after CORS but
+#    before security headers on the way out). Gates /api/* until DB init completes.
+app.add_middleware(ReadinessGuardMiddleware)
+
+# 3. Add CORSMiddleware LAST (executes FIRST — intercepts OPTIONS preflights
+#    before ReadinessGuard or any router sees them).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -155,6 +287,7 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=600,  # Cache preflight for 10 minutes
 )
+
 
 
 # Global exception handlers for gateway error consistency
@@ -294,26 +427,52 @@ def workspaces_alias(
 @app.get("/")
 def read_root():
     """
-    API Health check endpoint.
+    API liveness endpoint. Always responds immediately regardless of DB readiness.
     """
+    state = _app_state.value
     return {
         "status": "operational",
         "service": "EVE API Gateway",
-        "environment": settings.ENV
+        "environment": settings.ENV,
+        "ready": is_ready(),
+        "init_state": state,
     }
 
 @app.get("/healthz")
-def health_check(db: Session = Depends(get_db)):
+def health_check():
     """
-    Database-verified operational health check.
+    Database-verified health check.
+    Returns 200 during initialisation (liveness passes; database shows 'initializing').
+    Returns 200 + SELECT 1 ping once READY.
+    Returns 503 if background init failed.
     """
+    if _app_state == _ReadinessState.INITIALIZING:
+        return {
+            "status": "initializing",
+            "database": "connecting",
+            "service": "EVE API Gateway",
+        }
+
+    if _app_state == _ReadinessState.FAILED:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "database": "init_failed",
+                "detail": _init_failure_detail,
+            },
+        )
+
+    # READY: run a quick DB ping.
     try:
         from sqlalchemy import text
-        db.execute(text("SELECT 1"))
+        from app.database import engine
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         return {
             "status": "operational",
             "database": "connected",
-            "service": "EVE API Gateway"
+            "service": "EVE API Gateway",
         }
     except Exception as e:
         logger.error(f"Health check database query failure: {e}")
@@ -322,6 +481,7 @@ def health_check(db: Session = Depends(get_db)):
             content={
                 "status": "unhealthy",
                 "database": "disconnected",
-                "detail": "Failed to connect to the database"
-            }
+                "detail": "Failed to connect to the database",
+            },
         )
+

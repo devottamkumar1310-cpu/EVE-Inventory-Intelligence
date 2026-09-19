@@ -98,3 +98,10 @@ def pytest_configure(config):
         " Override only if you are certain: EVE_ALLOW_NONLOCAL_TEST_DB=1\n"
         "=========================================================================\n"
     )
+
+@pytest.fixture(autouse=True)
+def _force_app_ready():
+    # Because main.py uses background init, test clients hitting the app immediately
+    # will get 503s. We force the app to be READY for the test suite.
+    from app.main import _mark_ready
+    _mark_ready()
