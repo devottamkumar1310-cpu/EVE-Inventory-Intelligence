@@ -10,12 +10,12 @@ export async function updateSession(request: NextRequest) {
   const pathname = request.nextUrl.pathname
   logger.log(`[MIDDLEWARE] [START] Pathname: ${pathname}`)
 
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim()
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim()
 
-  // Keep public routes renderable when the preview process starts before its
-  // project variables are injected. Auth middleware can resume on the next
-  // request once the variables are available.
+  // The preview can receive its first request before project variables are
+  // injected. Do not construct a client with empty values; the SSR package
+  // throws synchronously in that case. Auth resumes on the next request.
   if (!supabaseUrl || !supabaseAnonKey) {
     logger.warn('[MIDDLEWARE] Supabase environment variables are unavailable; skipping session refresh')
     return supabaseResponse
