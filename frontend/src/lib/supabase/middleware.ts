@@ -10,17 +10,22 @@ export async function updateSession(request: NextRequest) {
   const pathname = request.nextUrl.pathname
   logger.log(`[MIDDLEWARE] [START] Pathname: ${pathname}`)
 
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim()
-  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim()
+  // Read and validate these at request time. Preview deployments can briefly
+  // receive a request before project variables are injected, and @supabase/ssr
+  // throws synchronously when either value is empty.
+  const supabaseConfig = [
+    process.env.NEXT_PUBLIC_SUPABASE_URL?.trim(),
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim(),
+  ] as const
 
-  // The preview can receive its first request before project variables are
-  // injected. Do not construct a client with empty values; the SSR package
-  // throws synchronously in that case. Auth resumes on the next request.
-  if (!supabaseUrl || !supabaseAnonKey) {
+  // Skip session work until the runtime configuration is available. The next
+  // request will retry auth without taking down the whole preview.
+  if (!supabaseConfig[0] || !supabaseConfig[1]) {
     logger.warn('[MIDDLEWARE] Supabase environment variables are unavailable; skipping session refresh')
     return supabaseResponse
   }
 
+  const [supabaseUrl, supabaseAnonKey] = supabaseConfig
   const supabase = createServerClient(
     supabaseUrl,
     supabaseAnonKey,
