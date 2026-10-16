@@ -10,9 +10,20 @@ export async function updateSession(request: NextRequest) {
   const pathname = request.nextUrl.pathname
   logger.log(`[MIDDLEWARE] [START] Pathname: ${pathname}`)
 
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+
+  // Keep public routes renderable when the preview process starts before its
+  // project variables are injected. Auth middleware can resume on the next
+  // request once the variables are available.
+  if (!supabaseUrl || !supabaseAnonKey) {
+    logger.warn('[MIDDLEWARE] Supabase environment variables are unavailable; skipping session refresh')
+    return supabaseResponse
+  }
+
   const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    supabaseUrl,
+    supabaseAnonKey,
     {
       cookies: {
         getAll() {
