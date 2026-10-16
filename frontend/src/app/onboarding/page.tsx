@@ -18,12 +18,12 @@ export default function OnboardingPage() {
   const [loadingDemoKey, setLoadingDemoKey] = useState<string | null>(null);
   const [showManualForm, setShowManualForm] = useState(false);
   const router = useRouter();
-  const supabase = createClient();
 
   useEffect(() => {
+    const supabase = createClient();
     // Check if user already has workspaces — if so, skip onboarding entirely
     async function checkWorkspace() {
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session } } = await createClient().auth.getSession();
       if (!session) {
         router.push("/login");
         return;
@@ -75,7 +75,7 @@ export default function OnboardingPage() {
     }
     
     checkWorkspace();
-  }, [router, supabase]);
+  }, [router]);
 
   const handleCreateWorkspace = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -83,7 +83,7 @@ export default function OnboardingPage() {
     setError(null);
     
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session } } = await createClient().auth.getSession();
       
       if (!session) {
         router.push("/login");
@@ -125,7 +125,7 @@ export default function OnboardingPage() {
     setLoadingDemoKey(demoCompany);
     setError(null);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session } } = await createClient().auth.getSession();
       if (!session) {
         router.push("/login");
         return;

@@ -214,7 +214,7 @@ class ReadinessGuardMiddleware:
                         "status": "error",
                         "code": "SERVER_INIT_FAILED",
                         "message": "Server failed to initialize. Check deployment logs.",
-                        "detail": _init_failure_detail,
+                        "detail": "The server could not finish initialization.",
                     },
                 )
                 await response(scope, receive, send)
@@ -280,7 +280,6 @@ app.add_middleware(ReadinessGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
